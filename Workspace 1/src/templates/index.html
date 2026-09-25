@@ -47,6 +47,7 @@
         <div><div class="label">Last close</div><div class="value" id="last"></div></div>
         <div><div class="label">Next-session return</div><div class="value" id="return"></div></div>
           <div><div class="label">Next-session close</div><div class="value" id="forecast"></div></div>
+        <div><div class="label">Next-session up probability</div><div class="value" id="probability"></div></div>
           <div><div class="label">One-week return</div><div class="value" id="weekly-return"></div></div>
           <div><div class="label">One-week close</div><div class="value" id="weekly-forecast"></div></div>
       </div>
@@ -62,7 +63,7 @@
       event.preventDefault();
       const ticker = document.querySelector('#ticker').value.trim().toUpperCase();
       button.disabled = true;
-      status.textContent = 'Retrieving recent market data...';
+      status.textContent = 'Training ticker-specific models and retrieving market data...';
       result.classList.remove('visible');
       try {
         const response = await fetch(`/api/predict?ticker=${encodeURIComponent(ticker)}`);
@@ -73,6 +74,7 @@
         document.querySelector('#last').textContent = data.last_close.toFixed(2);
         document.querySelector('#return').textContent = `${data.predicted_return >= 0 ? '+' : ''}${(data.predicted_return * 100).toFixed(2)}%`;
         document.querySelector('#forecast').textContent = data.predicted_close.toFixed(2);
+        document.querySelector('#probability').textContent = data.predicted_probability === undefined ? 'Unavailable' : `${(data.predicted_probability * 100).toFixed(2)}%`;
         document.querySelector('#weekly-return').textContent = data.predicted_weekly_return === null ? 'Unavailable' : `${data.predicted_weekly_return >= 0 ? '+' : ''}${(data.predicted_weekly_return * 100).toFixed(2)}%`;
         document.querySelector('#weekly-forecast').textContent = data.predicted_weekly_close === null ? 'Unavailable' : data.predicted_weekly_close.toFixed(2);
         document.querySelector('#notice').textContent = data.data_notice;

@@ -1,6 +1,6 @@
 import pandas as pd
 
-from src.evaluation import strategy_metrics, walk_forward_predict
+from src.evaluation import dynamic_positions, strategy_metrics, walk_forward_predict
 from src.features import FEATURE_COLUMNS
 
 
@@ -24,3 +24,19 @@ def test_strategy_metrics_charges_turnover() -> None:
 
     assert metrics["total_cost"] > 0
     assert metrics["strategy_total_return"] < metrics["strategy_gross_return"]
+
+
+def test_dynamic_positions_support_shorting_and_regime_filter() -> None:
+    probabilities = pd.Series([0.45, 0.48, 0.52, 0.55, 0.10, 0.20, 0.90, 0.80])
+    long_allowed = pd.Series([True, True, True, False, True, True, True, True])
+
+    positions = dynamic_positions(
+        probabilities,
+        quantile_window=4,
+        trade_quantile=0.25,
+        long_allowed=long_allowed,
+    )
+
+    assert positions.iloc[4] == -1
+    assert positions.iloc[6] == 1
+    assert positions.iloc[3] == 0

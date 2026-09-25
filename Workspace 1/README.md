@@ -18,10 +18,12 @@ python -m src.train --ticker AAPL --start 2015-01-01
 
 The default benchmark is `SPY`, the default sector ETF is `XLK`, and the default selected model is LSTM. The command writes `artifacts/model.joblib` and `artifacts/metrics.json`. The artifact contains separate models for the next session and five trading sessions ahead. The metrics include:
 
-- Holdout comparison for Ridge, gradient boosting, and random forest.
+- Holdout comparison for Ridge, gradient boosting, random forest, and LSTM.
 - Expanding walk-forward error and directional accuracy.
 - A naive buy-and-hold comparison.
 - Cost-aware strategy return, maximum drawdown, turnover, and total cost.
+
+Strategy signals use the rolling 10th and 90th probability quantiles over the recent 60 outputs: the upper tail opens a long (`1`), the lower tail opens an active short (`-1`), and the middle remains neutral (`0`). Long signals are disabled when price is below its 200-day SMA.
 
 Example with explicit research assumptions:
 
@@ -35,7 +37,7 @@ python -m src.train --ticker MSFT --benchmark SPY --sector XLK --model gradient_
 python -m src.predict --ticker AAPL
 ```
 
-The models predict returns rather than raw prices, which makes evaluation more meaningful across different price levels. The one-week horizon means five trading sessions. Context values are joined by session timestamp and are never backfilled from a future session. Treat results as research only.
+The models classify whether the next session or next five trading sessions will close higher, using binary cross-entropy/log loss. Direction probabilities are calibrated with historical up/down returns to produce illustrative close estimates. Features include MACD, RSI, moving averages, volume, the SPY benchmark, sector context, and VIX volatility context. The one-week horizon means five trading sessions. Context values are joined by session timestamp and are never backfilled from a future session. Treat results as research only.
 
 ## Web App
 
@@ -53,6 +55,8 @@ GET /health
 ```
 
 The app downloads the latest available Yahoo Finance history for the requested symbol and returns the last completed close plus next-session and one-week return and close estimates. Yahoo Finance data may be delayed; use a licensed streaming market-data provider for true real-time production predictions. Set `MODEL_PATH` and `PORT` environment variables when deploying the service.
+
+When a ticker is entered in the web app, the app trains fresh next-session and one-week models for that ticker before making the prediction. Models are cached in memory for the lifetime of the Flask process, so repeated requests for the same ticker reuse its models. Set `TRAIN_START` to change the historical training start date.
 
 ## Project Layout
 

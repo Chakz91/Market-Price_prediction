@@ -6,13 +6,15 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator, RegressorMixin, clone
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.linear_model import Ridge
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import log_loss
 
-from .features import get_feature_columns
+from .features import get_feature_columns, get_sequence_feature_columns
 
 MODEL_NAMES = ("ridge", "gradient_boosting", "random_forest", "lstm")
 
@@ -21,26 +23,35 @@ MODEL_NAMES = ("ridge", "gradient_boosting", "random_forest", "lstm")
 class WalkForwardResult:
     predictions: pd.Series
     actuals: pd.Series
+    actual_returns: pd.Series | None = None
 
 
-class LSTMRegressor(BaseEstimator, RegressorMixin):
-    """Small PyTorch LSTM with a scikit-learn compatible interface."""
+class LSTMClassifier(BaseEstimator, ClassifierMixin):
+    """Small two-layer PyTorch LSTM classifier trained with binary cross-entropy."""
 
     def __init__(
         self,
         lookback: int = 20,
         hidden_size: int = 32,
+        num_layers: int = 2,
+        dropout: float = 0.4,
         epochs: int = 40,
         batch_size: int = 32,
         learning_rate: float = 0.001,
         random_state: int = 42,
+        threshold: float = 0.05,  # <-- NEW: Only trade if prob > 0.55 or < 0.45
+        flip_penalty: float = 0.01,
     ) -> None:
         self.lookback = lookback
         self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout = dropout
         self.epochs = epochs
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.random_state = random_state
+        self.threshold = threshold
+        self.flip_penalty = flip_penalty
 
     @staticmethod
     def _torch():
@@ -55,16 +66,28 @@ class LSTMRegressor(BaseEstimator, RegressorMixin):
     def _network(self, input_size: int):
         torch = self._torch()
         hidden_size = self.hidden_size
+        num_layers = self.num_layers
+        dropout = self.dropout
 
         class Network(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                self.lstm = torch.nn.LSTM(input_size, hidden_size, batch_first=True)
+                self.lstm = torch.nn.LSTM(
+                    input_size,
+                    hidden_size,
+                    num_layers=num_layers,
+                    dropout=dropout,
+                    batch_first=True,
+                )
+                self.dropout = torch.nn.Dropout(dropout)
                 self.output = torch.nn.Linear(hidden_size, 1)
 
             def forward(self, values):
                 sequence, _ = self.lstm(values)
-                return self.output(sequence[:, -1, :]).squeeze(1)
+                # Fixed: safely squeeze only the final feature dimension
+                return torch.sigmoid(self.output(self.dropout(sequence[:, -1, :])).squeeze(-1))
+                
+                
 
         return Network()
 
@@ -72,18 +95,18 @@ class LSTMRegressor(BaseEstimator, RegressorMixin):
         torch = self._torch()
         if self.lookback < 1:
             raise ValueError("lookback must be positive")
+        if self.flip_penalty < 0:
+            raise ValueError("flip_penalty cannot be negative")
 
         values = np.asarray(X, dtype=np.float32)
         targets = np.asarray(y, dtype=np.float32)
         if len(values) < self.lookback:
             raise ValueError("LSTM lookback is longer than the training data")
 
-        self.scaler_ = StandardScaler().fit(values)
-        scaled_values = self.scaler_.transform(values).astype(np.float32)
-        self.history_ = scaled_values.copy()
+        self.history_ = values.copy()
         windows = np.stack(
             [
-                scaled_values[index - self.lookback + 1 : index + 1]
+                values[index - self.lookback + 1 : index + 1]
                 for index in range(self.lookback - 1, len(values))
             ]
         )
@@ -92,36 +115,48 @@ class LSTMRegressor(BaseEstimator, RegressorMixin):
         torch.manual_seed(self.random_state)
         self.network_ = self._network(values.shape[1])
         optimizer = torch.optim.Adam(self.network_.parameters(), lr=self.learning_rate)
-        loss_function = torch.nn.MSELoss()
+        loss_function = torch.nn.BCELoss()
         inputs = torch.from_numpy(windows)
-        labels = torch.from_numpy(window_targets)
+        labels = torch.from_numpy(window_targets).float()
+        inputs = self._normalize_windows(inputs)
         self.network_.train()
         for _ in range(self.epochs):
-            permutation = torch.randperm(len(inputs))
-            for start in range(0, len(inputs), self.batch_size):
-                batch = permutation[start : start + self.batch_size]
-                loss = loss_function(self.network_(inputs[batch]), labels[batch])
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            # Keep windows chronological so adjacent outputs represent adjacent days.
+            probabilities = self.network_(inputs)
+            loss = self._transaction_aware_loss(probabilities, labels, loss_function)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        self.network_state_ = self.network_.state_dict()
+        self.network_state_ = {
+            name: value.detach().clone()
+            for name, value in self.network_.state_dict().items()
+        }
         self.input_size_ = values.shape[1]
         del self.network_
         return self
 
-    def predict(self, X):
+    def _transaction_aware_loss(self, probabilities, labels, classification_loss):
+        torch = self._torch()
+        loss = classification_loss(probabilities, labels)
+        if len(probabilities) < 2:
+            return loss
+        previous_down = torch.relu(0.5 - probabilities[:-1])
+        current_up = torch.relu(probabilities[1:] - 0.5)
+        flip_loss = (previous_down * current_up).mean()
+        return loss + self.flip_penalty * flip_loss
+
+    def predict_proba(self, X):
         torch = self._torch()
         if not hasattr(self, "network_state_"):
             raise RuntimeError("The LSTM model must be fitted before prediction")
 
         values = np.asarray(X, dtype=np.float32)
-        scaled_values = self.scaler_.transform(values).astype(np.float32)
-        if len(scaled_values) == 1 and np.allclose(scaled_values[0], self.history_[-1]):
+        if len(values) == 1 and np.allclose(values[0], self.history_[-1]):
             combined = self.history_
             end_indices = [len(combined) - 1]
         else:
-            combined = np.vstack([self.history_, scaled_values])
+            combined = np.vstack([self.history_, values])
             first_new_index = len(self.history_)
             end_indices = range(first_new_index, len(combined))
         windows = np.stack(
@@ -133,31 +168,97 @@ class LSTMRegressor(BaseEstimator, RegressorMixin):
 
         network = self._network(self.input_size_)
         network.load_state_dict(self.network_state_)
+        windows = self._normalize_windows(torch.from_numpy(windows))
         network.eval()
         with torch.no_grad():
-            return network(torch.from_numpy(windows)).numpy()
+            probs = network(windows).numpy()
+            # Returns an [N, 2] array containing [P(Down), P(Up)]
+            return np.vstack([1 - probs, probs]).T
+
+    def predict(self, X):
+        # Maps continuous probabilities strictly to integer labels 0 or 1
+        #probs = self.predict_proba(X)[:, 1]
+        #return (probs >= 0.5).astype(int)
+
+        """Predicts directional classes incorporating a conviction filter.
+        
+        Returns:
+             1 : Strong Up Signal (Long)
+            -1 : Strong Down Signal (Short)
+             0 : Low Conviction Signal (Stay in Cash / Neutral)
+        """
+        # Extract the probability of the stock going up: P(Up)
+        probabilities = self.predict_proba(X)[:, 1]
+        
+        # Initialize an array of zeros (Neutral/Cash position)
+        positions = np.zeros_like(probabilities, dtype=np.int32)
+        
+        # Apply the threshold boundaries
+        upper_bound = 0.5 + self.threshold
+        lower_bound = 0.5 - self.threshold
+        
+        positions[probabilities >= upper_bound] = 1   # Long
+        positions[probabilities <= lower_bound] = -1  # Short
+        
+        return positions
+
+    @staticmethod
+    def _normalize_windows(windows):
+        # Normalize each feature channel across its time steps independently.
+        #channels_first = windows.transpose(1, 2)
+        #mean = channels_first.mean(dim=2, keepdim=True)
+        #standard_deviation = channels_first.std(
+        #    dim=2,
+        #    keepdim=True,
+        #    unbiased=False,
+        #).clamp_min(1e-6)
+        #return ((channels_first - mean) / standard_deviation).transpose(1, 2)
+
+        # Correctly normalises across the lookback dimension (dim=1) 
+        # while keeping feature dimensions entirely isolated.
+        mean = windows.mean(dim=1, keepdim=True)
+        standard_deviation = windows.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
+        return (windows - mean) / standard_deviation
+
+
+
+
+def predict_probability(model, X) -> np.ndarray:
+    """Return the probability of a positive next-price movement."""
+    if hasattr(model, "predict_proba"):
+        probabilities = np.asarray(model.predict_proba(X))
+        if probabilities.shape[1] == 1:
+            return np.full(len(X), float(model.classes_[0] >= 0.5))
+        return probabilities[:, 1]
+    return np.asarray(model.predict(X), dtype=float)
+
+
+# Keep older joblib artifacts loadable after the regression model was replaced.
+LSTMRegressor = LSTMClassifier
 
 
 def model_factory(name: str):
     if name == "ridge":
-        return make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        return make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=1000))
     if name == "gradient_boosting":
-        return GradientBoostingRegressor(
+        return GradientBoostingClassifier(
             n_estimators=150,
             learning_rate=0.04,
             max_depth=2,
+            loss="log_loss",
             random_state=42,
         )
     if name == "random_forest":
-        return RandomForestRegressor(
+        return RandomForestClassifier(
             n_estimators=200,
             max_depth=8,
             min_samples_leaf=5,
+            criterion="log_loss",
             random_state=42,
             n_jobs=-1,
         )
     if name == "lstm":
-        return LSTMRegressor()
+        return LSTMClassifier()
     raise ValueError(f"Unknown model {name!r}; choose from {MODEL_NAMES}")
 
 
@@ -166,6 +267,8 @@ def walk_forward_predict(
     model_name: str,
     initial_train_size: int,
     step: int = 5,
+    target_column: str = "target",
+    return_column: str | None = None,
 ) -> WalkForwardResult:
     """Refit on all available history, then predict the next step-sized block."""
     if initial_train_size < 1 or initial_train_size >= len(dataset):
@@ -173,6 +276,8 @@ def walk_forward_predict(
     if step < 1:
         raise ValueError("step must be positive")
 
+    if target_column not in dataset.columns and target_column == "target":
+        target_column = "target_return_1d"
     predictions: list[float] = []
     prediction_dates: list[pd.Timestamp] = []
     for start in range(initial_train_size, len(dataset), step):
@@ -180,16 +285,51 @@ def walk_forward_predict(
         model = clone(model_factory(model_name))
         train = dataset.iloc[:start]
         test = dataset.iloc[start:stop]
-        columns = get_feature_columns(dataset)
-        model.fit(train[columns], train["target_return_1d"])
-        predictions.extend(model.predict(test[columns]))
+        columns = (
+            get_sequence_feature_columns(dataset)
+            if model_name == "lstm"
+            else get_feature_columns(dataset)
+        )
+        fit_target = train[target_column]
+        if fit_target.nunique() < 2:
+            model = DummyClassifier(strategy="constant", constant=[fit_target.iloc[0]])
+        model.fit(train[columns], fit_target)
+        if target_column in {"target", "target_5d"}:
+            predictions.extend(predict_probability(model, test[columns]))
+        else:
+            predictions.extend(model.predict(test[columns]))
         prediction_dates.extend(test.index)
 
-    actuals = dataset.loc[prediction_dates, "target_return_1d"]
+    actuals = dataset.loc[prediction_dates, target_column]
+    actual_returns = None
+    if return_column is not None:
+        actual_returns = dataset.loc[prediction_dates, return_column]
     return WalkForwardResult(
         predictions=pd.Series(predictions, index=prediction_dates, name="prediction"),
         actuals=actuals.rename("actual"),
+        actual_returns=actual_returns,
     )
+
+
+def classification_metrics(actuals: pd.Series, probabilities: pd.Series) -> dict[str, float]:
+    clipped = probabilities.clip(1e-7, 1 - 1e-7)
+    return {
+        "log_loss": float(log_loss(actuals, clipped, labels=[0, 1])),
+        "directional_accuracy": float(((clipped >= 0.5) == (actuals >= 0.5)).mean()),
+    }
+
+
+def directional_return_calibration(
+    dataset: pd.DataFrame,
+    direction_column: str,
+    return_column: str,
+) -> dict[str, float]:
+    up_returns = dataset.loc[dataset[direction_column] >= 0.5, return_column]
+    down_returns = dataset.loc[dataset[direction_column] < 0.5, return_column]
+    return {
+        "up_return": float(up_returns.mean()),
+        "down_return": float(down_returns.mean()),
+    }
 
 
 def regression_metrics(actuals: pd.Series, predictions: pd.Series) -> dict[str, float]:
@@ -201,20 +341,70 @@ def regression_metrics(actuals: pd.Series, predictions: pd.Series) -> dict[str, 
     }
 
 
+def dynamic_positions(
+    probabilities: pd.Series,
+    max_position: float = 1.0,
+    quantile_window: int = 60,
+    trade_quantile: float = 0.10,
+    long_allowed: pd.Series | None = None,
+) -> pd.Series:
+    """Convert probabilities into rolling-quantile long, short, or neutral positions."""
+    if quantile_window < 2:
+        raise ValueError("quantile_window must be at least 2")
+    if not 0 < trade_quantile < 0.5:
+        raise ValueError("trade_quantile must be between 0 and 0.5")
+
+    values = pd.Series(probabilities, dtype=float)
+    upper = values.rolling(quantile_window, min_periods=quantile_window).quantile(
+        1 - trade_quantile
+    )
+    lower = values.rolling(quantile_window, min_periods=quantile_window).quantile(
+        trade_quantile
+    )
+    positions = pd.Series(0.0, index=values.index)
+    positions[values >= upper] = max_position
+    positions[values <= lower] = -max_position
+    if long_allowed is not None:
+        allowed = pd.Series(long_allowed, index=values.index).fillna(False).astype(bool)
+        positions[(positions > 0) & ~allowed] = 0.0
+    return positions
+
+
 def strategy_metrics(
     actuals: pd.Series,
     predictions: pd.Series,
     transaction_cost_bps: float,
     slippage_bps: float,
     max_position: float,
+    long_allowed: pd.Series | None = None,
+    quantile_window: int = 60,
+    trade_quantile: float = 0.10,
 ) -> dict[str, float]:
-    """Report a fixed-sign strategy after costs and a buy-and-hold benchmark."""
+    """Report a quantile-triggered long/short strategy after costs."""
     if min(transaction_cost_bps, slippage_bps) < 0:
         raise ValueError("costs cannot be negative")
     if not 0 < max_position <= 1:
         raise ValueError("max_position must be between 0 and 1")
+    if quantile_window < 2:
+        raise ValueError("quantile_window must be at least 2")
+    if not 0 < trade_quantile < 0.5:
+        raise ValueError("trade_quantile must be between 0 and 0.5")
 
-    positions = pd.Series(np.where(predictions >= 0, max_position, -max_position), index=predictions.index)
+    values = pd.Series(predictions, index=predictions.index, dtype=float)
+    if ((values < 0) | (values > 1)).any():
+        # Compatibility path for callers that still provide signed signals.
+        positions = pd.Series(
+            np.where(values >= 0, max_position, -max_position), index=values.index
+        )
+    else:
+        positions = dynamic_positions(
+            values,
+            max_position=max_position,
+            quantile_window=quantile_window,
+            trade_quantile=trade_quantile,
+            long_allowed=long_allowed,
+        )
+
     turnover = positions.diff().abs().fillna(positions.abs())
     cost_rate = (transaction_cost_bps + slippage_bps) / 10_000
     gross_returns = positions * actuals

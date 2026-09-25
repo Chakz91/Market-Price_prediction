@@ -22,5 +22,7 @@ def test_features_are_shifted_and_finite() -> None:
     assert set(BASE_FEATURE_COLUMNS).issubset(result.columns)
     assert "target_return_1d" in result.columns
     assert "target_return_5d" in result.columns
+    assert set(result["target"].unique()).issubset({0, 1})
+    assert set(result["target_5d"].unique()).issubset({0, 1})
     assert result.index.max() < index.max()
     assert result[BASE_FEATURE_COLUMNS + ["target_return_1d", "target_return_5d"]].notna().all().all()
