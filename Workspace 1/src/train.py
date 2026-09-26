@@ -9,13 +9,14 @@ from pathlib import Path
 import joblib
 import pandas as pd
 
-from .data import aligned_context_features, download_prices
+from .data import aligned_context_features, download_prices, get_sector_benchmark
 from .evaluation import (
     MODEL_NAMES,
     classification_metrics,
     directional_return_calibration,
     model_factory,
     predict_probability,
+    dynamic_positions,
     strategy_metrics,
     walk_forward_predict,
 )
@@ -28,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start", default="2015-01-01", help="Historical data start date")
     parser.add_argument("--end", default=None, help="Historical data end date")
     parser.add_argument("--benchmark", default="SPY", help="Benchmark ETF for market-regime features")
-    parser.add_argument("--sector", default="XLK", help="Sector ETF for sector features")
+    parser.add_argument("--sector", default=None, help="Sector ETF override for sector features")
     parser.add_argument("--volatility-index", default="^VIX", help="Volatility index for context features")
     parser.add_argument("--model", choices=MODEL_NAMES, default="lstm")
     parser.add_argument("--test-size", type=float, default=0.2, help="Chronological test fraction")
@@ -44,9 +45,10 @@ def main() -> None:
     if not 0 < args.test_size < 0.5:
         raise ValueError("--test-size must be between 0 and 0.5")
 
+    sector_symbol = args.sector or get_sector_benchmark(args.ticker)
     prices = download_prices(args.ticker, start=args.start, end=args.end)
     benchmark = download_prices(args.benchmark, start=args.start, end=args.end)
-    sector = download_prices(args.sector, start=args.start, end=args.end)
+    sector = download_prices(sector_symbol, start=args.start, end=args.end)
     volatility_index = download_prices(args.volatility_index, start=args.start, end=args.end)
     context = aligned_context_features(benchmark, sector, volatility_index)
     dataset = build_features(prices, context)
@@ -79,15 +81,38 @@ def main() -> None:
         target_column="target_5d",
         return_column="target_return_5d",
     )
-    selected_metrics = classification_metrics(walk_forward.actuals, walk_forward.predictions)
+
+    long_allowed = dataset.loc[walk_forward.actuals.index, "long_allowed"]
+    selected_metrics = classification_metrics(
+        walk_forward.actuals, walk_forward.predictions
+    )
+    trade_positions = dynamic_positions(
+        walk_forward.predictions,
+        max_position=1.0,
+        long_allowed=long_allowed,
+    )
+    active_trades = trade_positions != 0
+    if active_trades.any():
+        active_actuals = walk_forward.actuals[active_trades]
+        active_preds = trade_positions[active_trades].astype(int)
+        active_preds[active_preds == -1] = 0
+        trade_specific_metrics = classification_metrics(active_actuals, active_preds)
+        selected_metrics["trade_directional_accuracy"] = trade_specific_metrics[
+            "directional_accuracy"
+        ]
+        print(
+            f"🎯 Real Trading Directional Accuracy: "
+            f"{trade_specific_metrics['directional_accuracy']:.4f}"
+        )
+
     selected_metrics.update(
         strategy_metrics(
             walk_forward.actual_returns,
-            walk_forward.predictions,
+            walk_forward.predictions, # Keeps -1 for active short/exit positioning
             args.transaction_cost_bps,
             args.slippage_bps,
             args.max_position,
-            long_allowed=dataset.loc[walk_forward.actuals.index, "long_allowed"],
+            long_allowed=long_allowed,
         )
     )
 
@@ -107,7 +132,7 @@ def main() -> None:
     metrics = {
         "ticker": args.ticker.upper(),
         "benchmark": args.benchmark.upper(),
-        "sector": args.sector.upper(),
+        "sector": sector_symbol.upper(),
         "volatility_index": args.volatility_index.upper(),
         "train_rows": len(train),
         "test_rows": len(test),
@@ -137,7 +162,7 @@ def main() -> None:
             "sequence_features": sequence_feature_columns,
             "ticker": args.ticker.upper(),
             "benchmark": args.benchmark.upper(),
-            "sector": args.sector.upper(),
+            "sector": sector_symbol.upper(),
             "volatility_index": args.volatility_index.upper(),
             "return_calibration": return_calibration,
         },

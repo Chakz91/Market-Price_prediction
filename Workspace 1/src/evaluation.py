@@ -32,14 +32,15 @@ class LSTMClassifier(BaseEstimator, ClassifierMixin):
     def __init__(
         self,
         lookback: int = 20,
-        hidden_size: int = 32,
-        num_layers: int = 2,
-        dropout: float = 0.4,
+        hidden_size: int = 16,
+        num_layers: int = 1,
+        dropout: float = 0.0,
         epochs: int = 40,
         batch_size: int = 32,
-        learning_rate: float = 0.001,
+        learning_rate: float = 0.0001,
         random_state: int = 42,
-        threshold: float = 0.05,  # <-- NEW: Only trade if prob > 0.55 or < 0.45
+        long_threshold: float = 0.70,
+        short_threshold: float = 0.10,
         flip_penalty: float = 0.01,
     ) -> None:
         self.lookback = lookback
@@ -50,7 +51,8 @@ class LSTMClassifier(BaseEstimator, ClassifierMixin):
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.random_state = random_state
-        self.threshold = threshold
+        self.long_threshold = long_threshold
+        self.short_threshold = short_threshold
         self.flip_penalty = flip_penalty
 
     @staticmethod
@@ -126,6 +128,7 @@ class LSTMClassifier(BaseEstimator, ClassifierMixin):
             loss = self._transaction_aware_loss(probabilities, labels, loss_function)
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.network_.parameters(), max_norm=1.0)
             optimizer.step()
 
         self.network_state_ = {
@@ -176,30 +179,16 @@ class LSTMClassifier(BaseEstimator, ClassifierMixin):
             return np.vstack([1 - probs, probs]).T
 
     def predict(self, X):
-        # Maps continuous probabilities strictly to integer labels 0 or 1
-        #probs = self.predict_proba(X)[:, 1]
-        #return (probs >= 0.5).astype(int)
+        """Return long, short, or neutral signals using asymmetric cutoffs."""
+        short_threshold = getattr(self, "short_threshold", 0.10)
+        long_threshold = getattr(self, "long_threshold", 0.70)
+        if not 0 <= short_threshold < long_threshold <= 1:
+            raise ValueError("thresholds must satisfy 0 <= short < long <= 1")
 
-        """Predicts directional classes incorporating a conviction filter.
-        
-        Returns:
-             1 : Strong Up Signal (Long)
-            -1 : Strong Down Signal (Short)
-             0 : Low Conviction Signal (Stay in Cash / Neutral)
-        """
-        # Extract the probability of the stock going up: P(Up)
         probabilities = self.predict_proba(X)[:, 1]
-        
-        # Initialize an array of zeros (Neutral/Cash position)
         positions = np.zeros_like(probabilities, dtype=np.int32)
-        
-        # Apply the threshold boundaries
-        upper_bound = 0.5 + self.threshold
-        lower_bound = 0.5 - self.threshold
-        
-        positions[probabilities >= upper_bound] = 1   # Long
-        positions[probabilities <= lower_bound] = -1  # Short
-        
+        positions[probabilities >= long_threshold] = 1
+        positions[probabilities <= short_threshold] = -1
         return positions
 
     @staticmethod
@@ -345,21 +334,28 @@ def dynamic_positions(
     probabilities: pd.Series,
     max_position: float = 1.0,
     quantile_window: int = 60,
-    trade_quantile: float = 0.10,
+    trade_quantile: float | None = None,
     long_allowed: pd.Series | None = None,
+    long_quantile: float = 0.70,
+    short_quantile: float = 0.10,
 ) -> pd.Series:
-    """Convert probabilities into rolling-quantile long, short, or neutral positions."""
+    """Use asymmetric rolling quantiles to generate long, short, or neutral positions."""
     if quantile_window < 2:
         raise ValueError("quantile_window must be at least 2")
-    if not 0 < trade_quantile < 0.5:
-        raise ValueError("trade_quantile must be between 0 and 0.5")
+    if trade_quantile is not None:
+        if not 0 < trade_quantile < 0.5:
+            raise ValueError("trade_quantile must be between 0 and 0.5")
+        long_quantile = 1 - trade_quantile
+        short_quantile = trade_quantile
+    if not 0 <= short_quantile < long_quantile <= 1:
+        raise ValueError("quantiles must satisfy 0 <= short < long <= 1")
 
     values = pd.Series(probabilities, dtype=float)
     upper = values.rolling(quantile_window, min_periods=quantile_window).quantile(
-        1 - trade_quantile
+        long_quantile
     )
     lower = values.rolling(quantile_window, min_periods=quantile_window).quantile(
-        trade_quantile
+        short_quantile
     )
     positions = pd.Series(0.0, index=values.index)
     positions[values >= upper] = max_position
@@ -378,7 +374,9 @@ def strategy_metrics(
     max_position: float,
     long_allowed: pd.Series | None = None,
     quantile_window: int = 60,
-    trade_quantile: float = 0.10,
+    trade_quantile: float | None = None,
+    long_quantile: float = 0.70,
+    short_quantile: float = 0.10,
 ) -> dict[str, float]:
     """Report a quantile-triggered long/short strategy after costs."""
     if min(transaction_cost_bps, slippage_bps) < 0:
@@ -387,8 +385,13 @@ def strategy_metrics(
         raise ValueError("max_position must be between 0 and 1")
     if quantile_window < 2:
         raise ValueError("quantile_window must be at least 2")
-    if not 0 < trade_quantile < 0.5:
-        raise ValueError("trade_quantile must be between 0 and 0.5")
+    if trade_quantile is not None:
+        if not 0 < trade_quantile < 0.5:
+            raise ValueError("trade_quantile must be between 0 and 0.5")
+        long_quantile = 1 - trade_quantile
+        short_quantile = trade_quantile
+    if not 0 <= short_quantile < long_quantile <= 1:
+        raise ValueError("quantiles must satisfy 0 <= short < long <= 1")
 
     values = pd.Series(predictions, index=predictions.index, dtype=float)
     if ((values < 0) | (values > 1)).any():
@@ -401,7 +404,8 @@ def strategy_metrics(
             values,
             max_position=max_position,
             quantile_window=quantile_window,
-            trade_quantile=trade_quantile,
+            long_quantile=long_quantile,
+            short_quantile=short_quantile,
             long_allowed=long_allowed,
         )
 

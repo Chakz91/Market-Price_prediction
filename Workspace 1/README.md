@@ -16,14 +16,14 @@ python -m pip install -r requirements.txt
 python -m src.train --ticker AAPL --start 2015-01-01
 ```
 
-The default benchmark is `SPY`, the default sector ETF is `XLK`, and the default selected model is LSTM. The command writes `artifacts/model.joblib` and `artifacts/metrics.json`. The artifact contains separate models for the next session and five trading sessions ahead. The metrics include:
+The default benchmark is `SPY`; the sector ETF is inferred from Yahoo Finance and can be overridden with `--sector`. Unknown sectors fall back to `SPY`. The default selected model is LSTM. The command writes `artifacts/model.joblib` and `artifacts/metrics.json`. The artifact contains separate models for the next session and five trading sessions ahead. The metrics include:
 
 - Holdout comparison for Ridge, gradient boosting, random forest, and LSTM.
 - Expanding walk-forward error and directional accuracy.
 - A naive buy-and-hold comparison.
 - Cost-aware strategy return, maximum drawdown, turnover, and total cost.
 
-Strategy signals use the rolling 10th and 90th probability quantiles over the recent 60 outputs: the upper tail opens a long (`1`), the lower tail opens an active short (`-1`), and the middle remains neutral (`0`). Long signals are disabled when price is below its 200-day SMA.
+Strategy signals use the rolling 70th and 10th probability quantiles over the recent 60 outputs: the upper 30% opens a long (`1`), the lower 10% opens an active short (`-1`), and the middle remains neutral (`0`). Long signals are disabled when price is below its 200-day SMA. The LSTM's direct `predict()` method uses fixed probability cutoffs of `0.70` for long and `0.10` for short.
 
 Example with explicit research assumptions:
 
@@ -60,7 +60,7 @@ When a ticker is entered in the web app, the app trains fresh next-session and o
 
 ## Project Layout
 
-- `src/data.py`: data download and timestamp-aligned benchmark/sector features.
+- `src/data.py`: data download, sector ETF selection, and timestamp-aligned benchmark/sector features.
 - `src/features.py`: lagged, rolling, and context feature construction.
 - `src/evaluation.py`: model factories, walk-forward folds, and cost-aware metrics.
 - `src/train.py`: comparison, evaluation, and artifact creation.
