@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import warnings
 
 import pandas as pd
@@ -61,6 +62,77 @@ def download_prices(ticker: str, **kwargs) -> pd.DataFrame:
     if hasattr(prices.columns, "levels"):
         prices.columns = prices.columns.get_level_values(0)
     return prices.dropna(subset=["High", "Low", "Close", "Volume"])
+
+
+def download_ticker_news_sentiment(ticker_symbol: str) -> pd.DataFrame:
+    """Fetch available news and combine headline text by UTC publication date."""
+    try:
+        news_items = yf.Ticker(ticker_symbol).news or []
+    except Exception as error:
+        warnings.warn(
+            f"Could not fetch news for {ticker_symbol}; neutral sentiment will be used: {error}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        news_items = []
+
+    records: list[dict[str, object]] = []
+    for item in news_items:
+        content = item.get("content") or {}
+        published_at = item.get("providerPublishTime")
+        if published_at is None:
+            published_at = content.get("pubDate") or content.get("displayTime")
+        if published_at is None:
+            continue
+        try:
+            if isinstance(published_at, (int, float)):
+                published_date = datetime.fromtimestamp(
+                    published_at, tz=timezone.utc
+                ).date()
+            else:
+                published_date = pd.to_datetime(
+                    published_at, utc=True, errors="raise"
+                ).date()
+        except (OverflowError, TypeError, ValueError):
+            continue
+
+        title = content.get("title") or item.get("title") or ""
+        summary = content.get("summary") or item.get("summary") or ""
+        text = " ".join(part.strip() for part in (title, summary) if isinstance(part, str) and part.strip())
+        if text:
+            records.append({"Date": published_date, "Text": text})
+
+    if not records:
+        return pd.DataFrame(
+            {"Text": pd.Series(dtype="object")},
+            index=pd.DatetimeIndex([], name="Date"),
+        )
+
+    daily_news = pd.DataFrame(records)
+    daily_news["Date"] = pd.to_datetime(daily_news["Date"])
+    return daily_news.groupby("Date")["Text"].agg(" | ".join).to_frame()
+
+
+def build_macro_sentiment_features(
+    benchmark_ticker: str = "SPY", sector_ticker: str = "XLF"
+) -> pd.DataFrame:
+    """Score recent benchmark and sector headlines by their UTC publication date."""
+    from .features import calculate_finbert_score
+
+    sentiment_columns: list[pd.Series] = []
+    for ticker, column in (
+        (benchmark_ticker, "macro_spy_sentiment"),
+        (sector_ticker, "macro_sector_sentiment"),
+    ):
+        news = download_ticker_news_sentiment(ticker)
+        if news.empty:
+            scores = pd.Series(dtype="float64", name=column)
+        else:
+            scores = news["Text"].map(calculate_finbert_score).astype(float)
+            scores.name = column
+        sentiment_columns.append(scores)
+
+    return pd.concat(sentiment_columns, axis=1).sort_index()
 
 
 def aligned_context_features(

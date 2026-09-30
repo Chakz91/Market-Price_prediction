@@ -1,0 +1,553 @@
+Explanation of the project: how the trading prediction code works
+
+This document explains the project in plain English, with enough detail to help someone with minimal finance or programming knowledge understand what the code is doing.
+
+1. What the project is trying to do
+
+The project builds a model that tries to answer a simple question:
+
+- Will a stock go up over the next session (usually one trading day)?
+- Will it go up over the next five trading sessions (about one week)?
+
+It uses historical price data, market context, and sentiment from news headlines to make a probability estimate. The code then decides which model is most useful for that stock and uses it to predict the chance of a rise.
+
+The full process is:
+
+1. Download recent market data for the stock.
+2. Download benchmark and sector data such as SPY and a relevant ETF.
+3. Build features from prices, volatility, volume, trend, and sentiment.
+4. Split data into training and evaluation periods.
+5. Compare several machine learning models.
+6. Pick the best one using time-based validation.
+7. Save the model to disk.
+8. For a live prediction, load the trained model and calculate a probability for the next move.
+
+2. Main idea behind the code
+
+The code is not trying to predict the exact future price. Instead, it predicts the probability that the price will rise.
+
+For example, if the probability is 0.72, the code says:
+
+- There is a 72% chance the next session closes above the current close.
+- The model also estimates the likely return using historical average returns after similar past signals.
+
+This is a probability model, not a guarantee.
+
+3. Where the stock price and market data come from
+
+The project uses Yahoo Finance through the yfinance library.
+
+Relevant files:
+- src/data.py
+- src/features.py
+
+The code downloads:
+
+- the stock itself (for example AAPL, MSFT, UEC)
+- the benchmark index (default SPY)
+- the sector ETF (for example XLK, XLF, XLE)
+- volatility index (^VIX)
+- recent news headlines for the stock and for the benchmark/sector
+
+This creates a data picture of the stock and its market environment.
+
+4. How sector and benchmark context are aligned with timestamps
+
+This is important. The project does not just use the stock’s price; it also joins in other market information by the same date and time.
+
+The function aligned_context_features() in src/data.py does this.
+
+It takes:
+- the benchmark price table
+- the sector ETF price table
+- the volatility index table
+
+Then it puts all dates into one combined timeline and aligns them to the same market sessions. This means:
+
+- benchmark return on the same day as the stock
+- sector return on the same day as the stock
+- VIX level and VIX return on that date
+
+It is important that no future info is used to predict the past. The code deliberately does not backfill a future value into an earlier date. That means a feature is built only from data available at that time.
+
+Examples of context features created:
+- benchmark_return_1d
+- benchmark_volatility_20d
+- sector_return_1d
+- vix_level
+- vix_return_1d
+- vix_sma_20d
+
+This gives the model the market backdrop, not just the stock’s own history.
+
+5. How lagged and rolling features are built
+
+The feature engineering occurs in src/features.py.
+
+The code creates many numeric signals from the stock’s price history. These are called features.
+
+A few examples are:
+
+- return_1d: one-day return of the stock
+- return_5d: five-day return
+- return_20d: twenty-day return
+- volatility_20d: rolling standard deviation of returns
+- volume_change_1d: daily percentage change in trading volume
+- close_sma_ratio_10d: how close the current price is to its 10-day moving average
+- close_sma_ratio_50d: same idea for 50-day average
+- high_low_range: difference between daily high and low, scaled by price
+- macd: moving average convergence divergence
+- macd_signal: signal line for MACD
+- rsi_14: relative strength index
+- bollinger_percent_b and bollinger_bandwidth: volatility and price position relative to Bollinger Bands
+
+The key idea:
+- lagged features look at past returns and price behavior
+- rolling features summarize recent behavior over a window, such as 10 days, 20 days, or 50 days
+- these features help the model understand short-term momentum, volatility, and trend direction
+
+For a very simple example:
+
+- if a stock has been rising rapidly for 5 days, the return_5d feature is positive
+- if it is trading above its moving average, the close_sma_ratio_10d feature may be positive
+- if volatility is high, the rolling volatility feature will rise
+
+The model uses all of these together.
+
+6. How FinBERT sentiment is used for a ticker
+
+The project uses FinBERT, a sentiment model trained for financial text.
+
+The relevant code is in src/features.py:
+- calculate_finbert_score()
+- _point_in_time_news_sentiment()
+
+The process is:
+
+1. Download recent news text for the stock.
+2. Combine all headlines for a date into one text block.
+3. Pass that text to FinBERT.
+4. FinBERT assigns a score based on whether the text is positive, neutral, or negative.
+5. The code computes:
+   positive probability - negative probability
+
+So a score helps answer:
+
+- Does the news look more positive or more negative for this company?
+
+Example:
+- If the text says strong earnings, product growth, and upbeat commentary, the score may be positive.
+- If the headlines are negative due to losses, layoffs, or weak guidance, the score may be negative.
+
+This score becomes a feature called news_sentiment_ema.
+
+The code also uses benchmark and sector news sentiment, such as macro_spy_sentiment_ema and macro_sector_sentiment_ema.
+
+Important detail: the news sentiment is mapped to market sessions in a point-in-time way.
+
+That means if a news story is published on a date, the model uses it for the relevant market session and not for a later date when it would not have been known. The code shifts sentiment one session before use to avoid look-ahead bias.
+
+7. How target values are created
+
+The project creates target labels representing whether the stock goes up.
+
+In src/features.py, after building features, the code adds:
+
+- target_return_1d = next-day return
+- target_return_5d = next-five-day return
+- target = 1 if the next daily return is positive, else 0
+- target_5d = 1 if the next five-day return is positive, else 0
+
+So the model is trained to answer:
+
+- Did the price rise over the next day?
+- Did the price rise over the next five sessions?
+
+This is a binary classification problem: up or not up.
+
+8. How model comparison works
+
+The comparison logic is in src/train.py and src/evaluation.py.
+
+The project compares several models:
+- Ridge logistic regression
+- Gradient boosting
+- Random forest
+- LSTM (a recurrent neural network for time-series data)
+- optionally XGBoost for special regimes
+
+The model selection uses chronological validation, not random train/test splits.
+
+This matters because in financial data, time order matters. You should not train on future data and test on older data.
+
+The code calculates a validation set from later periods while training on earlier periods. It uses expanding windows and rolling folds.
+
+The function compare_probability_models() does this. It:
+
+1. Splits the data into multiple time-ordered folds.
+2. Trains on earlier data.
+3. Predicts later data.
+4. Calculates metrics on those predictions.
+5. Repeats across several folds.
+6. Chooses the model with the lowest log loss, then Brier score.
+
+The selection rule is:
+
+- best result = minimum (log_loss, brier_score)
+
+So the code prefers the model that is best at probability quality, not just classification guess rate.
+
+9. Which metrics are used to select models for prediction
+
+The main metrics are:
+
+- log loss
+- Brier score
+- calibration error (expected calibration error)
+- directional accuracy
+
+These are calculated by classification_metrics() in src/evaluation.py.
+
+Log loss measures how confident and correct the probability predictions are.
+- Lower is better.
+- A bad prediction with high confidence is penalized heavily.
+
+Brier score measures the average squared error between predicted probability and actual result (0 or 1).
+- Lower is better.
+
+Calibration error measures whether predicted probabilities match actual outcomes.
+- Example: if the model predicts 70% probability 100 times, then about 70 of those should actually be up.
+
+Directional accuracy measures whether the model predicted up vs. down correctly using a threshold of 0.5.
+- If probability >= 0.5, it calls it up.
+- If probability < 0.5, it calls it down.
+
+The code uses these to compare models over time.
+
+10. Holdout comparison for Ridge, gradient boosting, random forest, and LSTM
+
+In the training script, the code first runs a holdout comparison.
+
+This means:
+
+- train on one period
+- evaluate on a later period
+- compare the models on identical held-out data
+
+The README and code say the holdout comparison reports:
+- log loss
+- Brier score
+- calibration error
+- directional accuracy
+
+For each model:
+- Ridge
+- gradient boosting
+- random_forest
+- LSTM
+
+The holdout comparison helps answer: which model is most reliable on the data that was never used for training?
+
+The model with the lowest log loss is often preferred, with Brier score used as a tie-breaker.
+
+11. How next-day walk-forward and next-week walk-forward values are calculated
+
+Walk-forward evaluation is a very common time-series method. It simulates real use more honestly than a single static split.
+
+What the code does:
+
+- starts with a training period
+- predicts the next block of dates
+- then expands the training set with more recent data
+- predicts the next block again
+- repeats until the end of the available dataset
+
+This creates many sequential evaluations.
+
+The function walk_forward_predict() in src/evaluation.py does the actual work.
+
+For each step:
+
+1. Pick a training window up to a certain date.
+2. Refit the model on that window.
+3. Predict the next few rows.
+4. Compare the predictions to the actual up/down outcome.
+5. Move forward and repeat.
+
+The project then computes:
+- one-day walk-forward predictions for the chosen primary model
+- five-session walk-forward predictions for the selected weekly model
+
+These actuals are compared to probabilities from the model to compute log loss, Brier score, directional accuracy, and strategy outcomes.
+
+How this is used for model selection:
+
+- The code compares several models using identical chronological folds.
+- For each model, it takes the average probability quality across those folds.
+- The model with the lowest pooled log loss is chosen.
+- If tied, Brier score is used as a tie-breaker.
+- Calibration error is a diagnostic measure, not always the primary selector.
+
+12. How the regime is chosen: mean reversion vs trend momentum
+
+The code also asks: is this ticker acting more like a mean-reversion stock or a momentum/trend stock?
+
+This is computed in calculate_trend_strength() and get_regime_hyperparameters() in src/train.py.
+
+The logic checks how narrow the recent trading channel is and whether the recent price has a strong trend.
+
+If the price is moving in a narrow range and the recent trend is weak, it decides the stock is more mean reverting.
+If the stock is strongly trending or moving in a wider directional pattern, it decides it is momentum/trend.
+
+This matters because the target can switch:
+- mean reversion uses target_5d
+- momentum/trend uses target
+
+It also changes the type of model and features used.
+
+13. How the next-session up probability is calculated and used for prediction
+
+The probability comes from the fitted classifier.
+
+The function predict_probability() in src/evaluation.py does this:
+
+- if the model has a predict_proba() method, it calls it
+- it extracts the probability of the positive class (the "up" class)
+- returns a number between 0 and 1
+
+Example:
+- probability = 0.76 means 76% chance the next session closes higher than now
+
+Then the code uses this probability to estimate a return by calibrating it with historical average returns.
+
+The calibration step is:
+
+predicted_return = predicted_probability * up_return + (1 - predicted_probability) * down_return
+
+Where:
+- up_return is the average historical return when the outcome was up
+- down_return is the average historical return when the outcome was down
+
+So the model does not just say “up probability”; it also turns that probability into a return estimate.
+
+14. How the next-session return and one-week return are calculated
+
+The project calculates returns from average historical performance conditional on direction.
+
+The function directional_return_calibration() computes:
+
+- up_return = average return when the target direction was up
+- down_return = average return when the target direction was down
+
+For example:
+
+- If in prior data, positive days averaged +1.8% return, and negative days averaged -1.2%, then:
+  predicted_return = probability_of_up * 1.8% + probability_of_down * (-1.2%)
+
+That creates a forward-looking estimate of expected return.
+
+For one-week return:
+
+- the model predicts the probability of the stock being up in 5 sessions
+- it uses the average return observed after 5-session up periods and after 5-session down periods
+- the same formula is used
+
+So:
+
+predicted_weekly_return = weekly_probability * up_5d_return + (1 - weekly_probability) * down_5d_return
+
+The code saves a primary model for the next session and a weekly model for the next five sessions.
+
+15. How the model is saved and later reloaded
+
+The project saves a bundle with many pieces, including:
+- model
+- weekly_model
+- features
+- sequence_features
+- calibration values
+- ticker
+- benchmark
+- sector
+- trained_at timestamp
+
+This bundle is stored as a joblib file in artifacts/models/TICKER.joblib.
+
+This lets Flask reuse a previously trained model instead of rebuilding it every time.
+
+16. How Flask makes predictions
+
+The Flask app is in src/web.py.
+
+The web app listens for requests such as:
+- /api/predict?ticker=AAPL
+- /health
+
+When a request comes in, Flask does this:
+
+1. Reads the ticker from the URL.
+2. Validates the ticker format.
+3. Calls train_for_ticker(ticker).
+4. If a fresh trained bundle exists and is not too old, it uses it.
+5. Otherwise it downloads recent price and news data for that ticker.
+6. Finds the correct sector benchmark.
+7. Builds the latest feature row for the symbol.
+8. Uses the saved model to predict probability.
+9. Converts the probability into a return estimate using calibration values.
+10. Returns JSON with the prediction and summary.
+
+The final response includes fields such as:
+- ticker
+- sector
+- model
+- weekly_model
+- regime
+- as_of date
+- last_close
+- predicted_return
+- predicted_probability
+- predicted_close
+- predicted_weekly_return
+- predicted_weekly_probability
+
+17. On the first prediction for a new ticker, how Flask handles it
+
+If the user asks for a ticker that has never been trained before, Flask does not have a saved model bundle yet.
+
+The logic in train_for_ticker() does the following:
+
+1. Checks if artifacts/models/TICKER.joblib exists.
+2. If it does not exist, it uses the default benchmark and sector to infer context.
+3. Downloads the ticker’s price history.
+4. Downloads benchmark, sector, and VIX data.
+5. Downloads recent news headlines and macro sentiment.
+6. Builds the feature dataset.
+7. Detects whether the stock is in mean-reversion or trend mode.
+8. Compares candidate models with the same chronological process used in training.
+9. Fits the best model for the primary horizon and the weekly horizon.
+10. Saves the resulting model bundle to disk.
+11. Returns the trained models for the live prediction.
+
+This means the first prediction request can also be a training event for that ticker.
+
+18. If the ticker has been trained using src/train.py, how Flask chooses the model to use
+
+This is very important.
+
+When Flask loads a ticker bundle, it first checks:\n
+- artifacts/models/TICKER.joblib
+
+Then it verifies that:
+- the saved ticker matches the requested ticker
+- the model bundle contains all required fields
+- the trained_at timestamp is valid
+- the model is not older than 60 days
+
+Once validated, it loads:
+- the saved primary model
+- the saved weekly model
+- the model names
+- the feature columns
+- the calibration values
+
+Then it uses those saved values directly.
+
+If the bundle is missing, invalid, mismatched, expired, or incomplete, Flask discards it and trains a new one.
+
+In other words:
+
+- if the model is fresh and valid, Flask reuses it
+- if not, Flask retrains the ticker and saves a new bundle
+
+This logic is inside create_app() and train_for_ticker() in src/web.py.
+
+19. How the naive buy-and-hold comparison works
+
+The code also compares the strategy to a simple baseline: buy and hold.
+
+In strategy_metrics(), the code computes:
+
+- benchmark_returns = actuals
+- buy_and_hold_total_return = product of (1 + returns) minus 1
+
+This means:
+
+- if you simply bought the stock and held it through the evaluation period, what is the total return?
+
+This is a baseline comparison. A strategy only adds value if it beats this simple buy-and-hold result after costs.
+
+20. How cost-aware strategy return, maximum drawdown, turnover, and total cost are calculated
+
+The code creates a strategy using probability-based position sizing.
+
+It computes dynamic positions using rolling quantiles, especially in dynamic_positions().
+
+The logic is roughly:
+
+- if the predicted probability is very high, the strategy goes long
+- if it is very low, the strategy goes short
+- if it is in the middle, it stays neutral
+
+The thresholds are based on rolling quantiles over recent predictions.
+
+Then strategy_metrics() calculates:
+
+- gross_returns = positions * actual returns
+- turnover = change in position from one period to the next
+- cost_rate = (transaction_cost_bps + slippage_bps) / 10,000
+- net_returns = gross_returns - turnover * cost_rate
+
+This means the strategy pays trading costs when it changes position size.
+
+The following are reported:
+
+- strategy_gross_return: return before costs
+- strategy_total_return: return after costs
+- buy_and_hold_total_return: passive benchmark return
+- strategy_max_drawdown: largest drop from a prior peak
+- total_turnover: sum of all position changes
+- total_cost: total trading cost paid
+
+The maximum drawdown is calculated from cumulative return:
+
+- drawdown_curve = cumulative return
+- drawdown = drawdown_curve / previous_peak - 1
+- drawdown.min() gives the worst drop
+
+This is important because a strategy can have good average return but still be risky if it has large drawdowns.
+
+21. How the project works as a complete pipeline
+
+At a high level, the full workflow is:
+
+1. Load price history.
+2. Build market context and sentiment.
+3. Engineer lagged and rolling features.
+4. Create target labels for next-day and next-five-day moves.
+5. Compare models with walk-forward validation.
+6. Select the best-performing model.
+7. Fit the chosen model.
+8. Save the model bundle.
+9. For live prediction, load the bundle and estimate the chance of an increase.
+
+22. Why the project is research-oriented
+
+The README explicitly says the results are for research only.
+
+This is because:
+- market data may be delayed or incomplete
+- Yahoo Finance is not a real-time institutional feed
+- sentiment from headlines is imperfect
+- the model is a statistical estimate and not a guarantee
+
+This is a research and educational project, not a production trading system.
+
+23. Short summary
+
+In one sentence:
+
+The project collects stock, market, and sentiment data, turns them into features, compares several time-aware models, 
+selects the best one using probability metrics, and uses that model to predict the chance of a rise and estimate 
+the expected return for the next session or next week.
+
+

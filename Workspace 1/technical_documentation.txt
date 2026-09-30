@@ -1,0 +1,516 @@
+Technical Documentation
+
+1. Overview
+
+This project implements a time-series classification pipeline for predicting whether a stock will move up over the next trading session or over the next five trading sessions. The implementation combines:
+
+- market price data
+- benchmark and sector context
+- volatility features
+- technical indicators
+- sentiment features derived from news headlines using FinBERT
+- multiple classifier families
+- chronological model selection and walk-forward evaluation
+- a Flask API for online inference
+
+The project is primarily organized around the following modules:
+
+- src/data.py
+- src/features.py
+- src/evaluation.py
+- src/train.py
+- src/web.py
+- src/predict.py
+
+2. High-level architecture
+
+The system follows a pipeline structure:
+
+1. Download price history and market context.
+2. Build aligned market features from benchmark, sector, and volatility inputs.
+3. Generate technical and sentiment features from ticker data and news.
+4. Create directional targets for next-day and next-week movements.
+5. Train candidate models using time-aware validation.
+6. Compare models using probability metrics such as log loss and Brier score.
+7. Select the best model for the ticker and horizon.
+8. Save a model bundle to disk.
+9. Reuse the saved bundle for inference in Flask or through the prediction CLI.
+
+3. File-by-file breakdown
+
+3.1 src/data.py
+
+Purpose:
+This file handles retrieval of market and news data, sector mapping, and timestamp alignment between market data series.
+
+Key functions:
+
+- get_sector_benchmark(ticker_symbol: str) -> str
+  - Maps a stock ticker to a sector ETF such as XLK, XLF, XLE, etc.
+  - Includes overrides for niche cases like UEC -> URA, AAL -> JETS.
+  - Falls back to SPY when the sector is unavailable or unknown.
+
+- download_prices(ticker: str, **kwargs) -> pd.DataFrame
+  - Pulls OHLCV data from Yahoo Finance using yfinance.
+  - Drops rows with missing essential price volume fields.
+  - Handles multi-level column structures returned by Yahoo Finance.
+
+- download_ticker_news_sentiment(ticker_symbol: str) -> pd.DataFrame
+  - Fetches available news entries for the ticker.
+  - Extracts publication date and text from headline/summary blocks.
+  - Aggregates news by UTC date into a single text record per date.
+
+- build_macro_sentiment_features(benchmark_ticker: str = "SPY", sector_ticker: str = "XLF") -> pd.DataFrame
+  - Downloads news for the benchmark and sector ETF.
+  - Scores the text through FinBERT.
+  - Produces daily benchmark and sector sentiment series.
+
+- aligned_context_features(benchmark, sector, volatility_index)
+  - Builds a merged date index for benchmark, sector, and VIX data.
+  - Computes:
+    - benchmark_return_1d
+    - benchmark_volatility_20d
+    - sector_return_1d
+    - vix_level
+    - vix_return_1d
+    - vix_sma_20d
+  - Uses union of indexes and does not backfill future values into earlier sessions.
+
+- generate_aligned_targets(df, target_column="return_1d")
+  - Creates direction targets shifted one step forward.
+  - Emphasizes a time-aware design: current features are matched to future direction rather than using non-forward-looking signal leakage.
+
+Important technical note:
+The code is designed to respect point-in-time information. It does not create synthetic features using values that would not have been available at that timestamp.
+
+3.2 src/features.py
+
+Purpose:
+This file defines feature engineering, sentiment scoring, and the final feature sets used for model training and inference.
+
+Core constants:
+
+- BASE_FEATURE_COLUMNS: basic price/volume/technical features
+- CONTEXT_FEATURE_COLUMNS: benchmark, sector, volatility, and sentiment features
+- FEATURE_COLUMNS: combined base + context features
+- SEQUENCE_FEATURE_COLUMNS: LSTM-friendly time series columns
+- MEAN_REVERSION_FEATURE_COLUMNS: RSI/Bollinger-based features used for mean-reversion settings
+
+Key functions:
+
+- calculate_finbert_score(text: str) -> float
+  - Loads ProsusAI/finbert from Hugging Face the first time it is needed.
+  - Tokenizes the text and runs the model in evaluation mode.
+  - Computes the confidence of the positive and negative classes.
+  - Returns positive_prob - negative_prob.
+
+- _point_in_time_news_sentiment(news_df, price_index)
+  - Aligns news headlines to market sessions using timestamps.
+  - For each date, combines text from all news items.
+  - Scores the combined text with FinBERT.
+  - Uses an exponentially weighted moving average with span=3 and shifts by one session to avoid look-ahead leakage.
+
+- _point_in_time_scored_sentiment(sentiment_by_date, price_index, feature_name)
+  - Same point-in-time alignment idea, but for benchmark/sector sentiment already produced as daily logical scores.
+
+- winsorize_series(series, lower_q=0.01, upper_q=0.99)
+  - Limits extreme values based on historically learned quantiles using expanding windows.
+  - Helps stabilize model learning and reduce sensitivity to outlier moves.
+
+- get_feature_columns(dataset, mean_reversion=False)
+  - Returns the standard feature set for tabular models.
+  - If the regime is mean-reverting, it swaps return_1d for smoothed_return_1d.
+
+- get_sequence_feature_columns(dataset, mean_reversion=False)
+  - Returns the sequence features for LSTM models.
+  - Adds mean reversion columns when needed.
+
+- build_features(prices, context=None, include_target=True, news_df=None, macro_sentiment_df=None)
+  - Builds the main feature table for a ticker.
+  - Computes:
+    - return_1d, return_5d, return_20d
+    - volatility_20d
+    - volume_change_1d
+    - SMA ratios for 10d and 50d
+    - high-low range
+    - MACD and MACD signal
+    - RSI(14)
+    - Bollinger percent B and bandwidth
+    - news_sentiment_ema
+    - macro_spy_sentiment_ema
+    - macro_sector_sentiment_ema
+  - Joins context after base features are created.
+  - If include_target is true, adds target_return_1d, target_return_5d, target, target_5d.
+
+Design detail:
+The use of shift(1) and point-in-time assignment avoids training on information not available at that trading session end.
+
+3.3 src/evaluation.py
+
+Purpose:
+This file defines the model factories, probability estimation utilities, walk-forward evaluation, metrics, and strategy accounting.
+
+Model collection:
+MODEL_NAMES = ("ridge", "gradient_boosting", "random_forest", "lstm", "xgboost")
+
+Dataclass:
+- WalkForwardResult
+  - predictions: modeled probability predictions
+  - actuals: actual direction labels
+  - actual_returns: realized returns associated with those periods
+  - is_mean_reverter: regime flag per prediction window
+
+LSTMClassifier
+
+This custom class wraps a PyTorch LSTM trained for binary classification of directional moves.
+
+Key implementation details:
+
+- __init__(...)
+  - sets hyperparameters such as lookback, hidden_size, num_layers, dropout, epochs, batch_size, learning_rate, validation_fraction, validation_gap, patience, and thresholds
+
+- _torch()
+  - lazy loader for PyTorch
+
+- _network(input_size)
+  - creates a one- or multi-layer LSTM with a sigmoid output head
+
+- fit(X, y)
+  - Converts features into lookback windows for time-series prediction
+  - Builds training and validation sequences
+  - Normalizes feature values using training statistics
+  - Uses early stopping on validation loss
+  - Stores learned network state for future inference
+
+- _fit_normalizer(values)
+  - computes mean and standard deviation for feature normalization
+
+- _fit_epoch / _fit_epochs
+  - perform stochastic optimization with Adam
+
+- _transaction_aware_loss(probabilities, labels, classification_loss)
+  - adds a penalty that discourages rapid probability flips between adjacent windows
+
+- predict_proba(X)
+  - creates LSTM windows for the provided rows
+  - loads the learned LSTM state
+  - returns probability of class 1 (up move) in the shape [N, 2] with [P(down), P(up)] order
+
+- predict(X)
+  - returns discrete positions using asymmetric thresholds:
+    - probability >= 0.70 -> +1
+    - probability <= 0.10 -> -1
+    - otherwise 0
+
+Utility functions:
+
+- predict_probability(model, X)
+  - Generic probability extractor for models that support predict_proba
+  - For sklearn classifiers, returns the second column from predict_proba
+  - Handles constant-fallback models
+
+- fit_classifier_or_constant(model, features, target)
+  - Fits the model normally.
+  - If the target has only one class, switches to a DummyClassifier with constant prediction.
+
+- model_factory(name, **kwargs)
+  - Builds each model type:
+    - ridge -> pipeline(StandardScaler + LogisticRegression)
+    - gradient_boosting -> GradientBoostingClassifier
+    - random_forest -> RandomForestClassifier
+    - lstm -> LSTMClassifier
+    - xgboost -> XGBClassifier when available
+
+- walk_forward_predict(...)
+  - Implements expanding-window time-series evaluation.
+  - For each time block:
+    1. train on all known data before the test block
+    2. optionally select a regime based on historical price behavior
+    3. select a model type (ridge, random_forest, etc.)
+    4. fit model
+    5. predict on the next block
+    6. collect actual outcomes and returns
+
+Important behavior:
+The regime selector may override the model to:
+- xgboost in extreme skew regimes
+- ridge in short-history regimes
+- mean-reversion or trend-based target columns depending on the detected regime
+
+Classification metrics:
+
+- classification_metrics(actuals, probabilities)
+  - Uses log_loss from sklearn.
+  - Computes Brier score as mean squared error between predicted probabilities and binary outcome.
+  - Computes expected calibration error by binning predictions into 10 bins and measuring average gap between average probability and average actual.
+  - Computes directional_accuracy using threshold 0.5.
+
+Model comparison:
+
+- compare_probability_models(features_by_model, target, candidates_by_model, folds=3, gap=1)
+  - Creates time-ordered validation folds.
+  - For each model and candidate config, trains on earlier data and validates on later windows.
+  - Aggregates probability metrics across folds.
+  - Chooses the candidate with the lowest (log_loss, brier_score) tuple.
+
+This is the primary selection mechanism for choosing the winning probability model.
+
+Calibration and return mapping:
+
+- directional_return_calibration(dataset, direction_column, return_column)
+  - Computes average return conditioned on the sign of the target.
+  - Produces:
+    - up_return
+    - down_return
+  - Used to convert a predicted probability into an expected return estimate.
+
+Strategy logic:
+
+- dynamic_positions(...)
+  - Converts probability series into discrete positions: +1 long, -1 short, 0 neutral.
+  - Uses rolling quantiles to set upper and lower thresholds.
+  - Long trades may be blocked if the price is below its 200-day SMA.
+  - Supports mean-reversion inversion for certain regime settings.
+
+- strategy_metrics(...)
+  - Computes strategy-level returns and risk metrics after costs.
+  - Gross return before costs
+  - Net return after transactions and slippage
+  - Benchmark buy-and-hold return
+  - Max drawdown
+  - Average position
+  - Total turnover
+  - Total cost
+
+The cost formula is:
+- cost_rate = (transaction_cost_bps + slippage_bps) / 10,000
+- net_returns = gross_returns - turnover * cost_rate
+
+The project therefore evaluates not just raw directional correctness but also economic realism after trading costs.
+
+3.4 src/train.py
+
+Purpose:
+This is the primary training and artifact-generation pipeline. It downloads data, creates features, compares models, evaluates them, and saves the best model bundle.
+
+Important functions:
+
+- ticker_model_artifact_path(ticker, artifacts_dir)
+  - Builds the on-disk path for the per-ticker model bundle.
+
+- calculate_trend_strength(close_prices, window=60) -> bool
+  - Measures whether the recent price path is narrow and weakly trending.
+  - Uses price channel width and recent log-price slope.
+  - Returns True when it appears to be mean-reverting rather than strongly trending.
+
+- get_regime_hyperparameters(close_prices, sector_symbol)
+  - Chooses model regime and learning configuration.
+  - Cases:
+    - extreme skew -> force xgboost
+    - short history -> force linear baseline
+    - mean reversion -> use different LSTM parameters
+    - momentum/trend -> use a different LSTM configuration
+  - Returns a dictionary of model configuration and regime flags.
+
+- _lstm_parameter_candidates(base)
+  - Creates several candidate LSTM settings around the base configuration.
+
+- _probability_model_candidates(lstm_base, horizon)
+  - Returns candidate model parameter sets for ridge, gradient boosting, random forest, and LSTM for a given horizon.
+
+- parse_args()
+  - CLI parser for training configuration.
+  - Supports ticker, benchmark, sector, volatility index, model choice, test size, walk-forward step, transaction/slippage cost, and max position.
+
+- main()
+  - Orchestrates the full training process:
+    1. resolve benchmark and sector symbols
+    2. download price, context, and news data
+    3. build the full feature set
+    4. split into train/test with chronological ordering
+    5. determine holdout regime using recent history
+    6. pick a holdout model name
+    7. compare candidate models for the selected horizon
+    8. evaluate holdout performance and walk-forward performance
+    9. select the final model for that ticker
+    10. fit the final model
+    11. save artifact bundle to disk
+
+Model selection logic in main():
+
+- holdout_regime_params = get_regime_hyperparameters(...)
+- holdout_is_mean_reverter = bool(...)
+- holdout_target = "target_5d" if holdout_is_mean_reverter else "target"
+- holdout_horizon = 5 if holdout_is_mean_reverter else 1
+
+Then the code runs:
+
+- compare_probability_models(...) for the selected horizon
+- compare_probability_models(...) for the weekly target
+
+The winner is selected based on the lower pooled log loss, with Brier score as tie-breaker.
+
+Final model configuration:
+
+- final_model_name = selected_probability_model_name if regime matches selected configuration else args.model
+- final_weekly_model_name = selected_weekly_model_name if regime matches else final_model_name
+
+The final bundle includes:
+- model
+- weekly_model
+- model_name
+- weekly_model_name
+- model_horizon_sessions
+- weekly_horizon_sessions
+- features
+- sequence_features
+- return_calibration
+- trained_at
+- ticker, benchmark, sector, volatility_index
+
+3.5 src/predict.py
+
+Purpose:
+Simple CLI prediction entry point. It loads a saved model artifact, builds the latest feature row for the ticker, and prints a probability and expected return estimate.
+
+Flow:
+
+1. Load bundle from artifacts/model.joblib.
+2. Read the ticker from CLI argument or bundled metadata.
+3. Download recent price and context data for the last year.
+4. Download news and sentiment data.
+5. Build feature rows using build_features(..., include_target=False).
+6. Extract the latest record.
+7. Determine whether the saved model is LSTM-based or not.
+8. Select feature columns based on model type.
+9. Call predict_probability(model, latest_values).
+10. Use return calibration to estimate predicted_return.
+11. Print predicted probability and approximate close.
+
+The probability is converted into a return using historical conditioned returns:
+
+predicted_return = p_up * up_return + (1 - p_up) * down_return
+
+3.6 src/web.py
+
+Purpose:
+This file exposes a Flask API for prediction requests against a ticker.
+
+Key constants:
+- TICKER_PATTERN = regex allowing standard ticker syntax
+- MODEL_PATH = default model bundle path
+- TRAIN_START = default historical start date
+- MAX_TICKER_MODEL_AGE = timedelta(days=60)
+
+create_app(model_path=MODEL_PATH)
+
+This function sets up the Flask app and defines a cached model loader.
+
+train_for_ticker(ticker)
+
+This function implements the core ticker-serving logic:
+
+1. Check in-memory trained_models cache.
+2. If the ticker is cached and not expired, reuse it.
+3. Otherwise check artifacts/models/TICKER.joblib.
+4. Validate:
+   - ticker name matches
+   - required keys are present
+   - trained_at is valid and not expired
+5. If valid, reload the saved model bundle.
+6. If not valid or expired, train a new model for the ticker.
+
+Training a new model for the ticker includes:
+- detect regime via get_regime_hyperparameters
+- determine horizon (1 or 5)
+- compare candidate models with compare_probability_models
+- fit the primary and weekly model
+- compute return calibration tables
+- persist the bundle to disk
+
+Prediction endpoint:
+
+@app.get("/api/predict")
+
+Flow:
+
+1. Read ticker parameter from URL.
+2. Validate ticker syntax.
+3. Call train_for_ticker(ticker).
+4. Download the latest price data for the requested ticker.
+5. Download benchmark, sector, and volatility context.
+6. Download news and macro sentiment.
+7. Build the latest feature row using build_features(..., include_target=False).
+8. Choose the correct model columns based on whether the model is LSTM.
+9. Predict next-session probability and weekly probability.
+10. Convert probabilities to expected return using the calibration dictionary.
+11. Return JSON payload.
+
+The response contains:
+- ticker
+- sector
+- model name
+- weekly_model name
+- regime
+- as_of
+- last_close
+- predicted_return
+- predicted_probability
+- predicted_close
+- predicted_weekly_return
+- predicted_weekly_probability
+- predicted_weekly_close
+
+4. Time-series validation approach
+
+The code intentionally avoids random split validation because financial data is ordered and autocorrelated.
+
+The project uses:
+- expanding train windows
+- fixed time gaps between train and validation sections
+- chronological folds
+- regime-aware model selection
+
+This ensures the evaluation resembles real-world usage more closely than a shuffled train/test split.
+
+5. Probability and return estimation
+
+The project predicts class probability, not just direction.
+
+For a given row:
+
+- model outputs p_up in [0, 1]
+- this is interpreted as probability of a positive move
+
+Then the project converts this into expected return via historical calibration:
+
+expected_return = p_up * mean_return_if_up + (1 - p_up) * mean_return_if_down
+
+This gives a realistic estimate even when the model only predicts probability of direction.
+
+6. Why the architecture is robust
+
+Key technical decisions in this implementation:
+
+- uses point-in-time joins to avoid future leakage
+- trains and validates in chronological order
+- keeps model selection separate from final fitting
+- uses per-horizon model selection for primary and weekly tasks
+- caches ticker bundles with age checks to avoid stale models
+- stores saved feature metadata to ensure model compatibility at inference time
+
+7. Summary
+
+The implementation is a complete research-oriented ML pipeline for market direction prediction. It combines classical financial features, macro market context, news-driven sentiment, and multiple models with rigorous time-aware selection. The project is designed to be transparent, reproducible, and practical for experimentation, while emphasizing that outputs are estimates and not financial advice.
+
+8. Notes for maintainers
+
+When extending the project, the most important contracts are:
+
+- feature alignment must remain point-in-time
+- model bundles must include feature metadata needed for inference
+- calibration dictionaries must be saved with the model
+- model selection must remain time-aware
+- stale ticker models should be retrained when expired
+
+This file is intentionally focused on implementation and technical correctness, not on investment advice.

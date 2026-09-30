@@ -1,0 +1,13 @@
+{
+  "label": "web_results",
+  "ticker": "C",
+  "as_of": "2026-09-29",
+  "last_close": 130.80,
+  "primary_horizon": "next-session",
+  "predicted_return": 0.0009,
+  "predicted_close": 130.91,
+  "predicted_probability": 0.5233,
+  "weekly_return": 0.0029,
+  "weekly_close": 131.18,
+  "data_notice": "This is not a financial advice. The predictions are based on historical data and may not reflect future performance. Please consult a financial advisor before making investment decisions."
+}

@@ -45,11 +45,11 @@
       <div class="date" id="date"></div>
         <div class="grid">
         <div><div class="label">Last close</div><div class="value" id="last"></div></div>
-        <div><div class="label">Next-session return</div><div class="value" id="return"></div></div>
-          <div><div class="label">Next-session close</div><div class="value" id="forecast"></div></div>
-        <div><div class="label">Next-session up probability</div><div class="value" id="probability"></div></div>
-          <div><div class="label">One-week return</div><div class="value" id="weekly-return"></div></div>
-          <div><div class="label">One-week close</div><div class="value" id="weekly-forecast"></div></div>
+        <div><div class="label" id="return-label">Next-session return</div><div class="value" id="return"></div></div>
+          <div><div class="label" id="forecast-label">Next-session close</div><div class="value" id="forecast"></div></div>
+        <div><div class="label" id="probability-label">Next-session up probability</div><div class="value" id="probability"></div></div>
+          <div class="weekly-metric"><div class="label">One-week return</div><div class="value" id="weekly-return"></div></div>
+          <div class="weekly-metric"><div class="label">One-week close</div><div class="value" id="weekly-forecast"></div></div>
       </div>
       <p class="notice" id="notice"></p>
     </section>
@@ -72,6 +72,14 @@
         document.querySelector('#heading').textContent = data.ticker;
         document.querySelector('#date').textContent = `Data through ${data.as_of}`;
         document.querySelector('#last').textContent = data.last_close.toFixed(2);
+        const isWeeklyPrimary = data.model_horizon_sessions === 5;
+        const primaryHorizon = isWeeklyPrimary ? 'One-week' : 'Next-session';
+        document.querySelector('#return-label').textContent = `${primaryHorizon} return`;
+        document.querySelector('#forecast-label').textContent = `${primaryHorizon} close`;
+        document.querySelector('#probability-label').textContent = `${primaryHorizon} up probability`;
+        document.querySelectorAll('.weekly-metric').forEach((element) => {
+          element.hidden = isWeeklyPrimary;
+        });
         document.querySelector('#return').textContent = `${data.predicted_return >= 0 ? '+' : ''}${(data.predicted_return * 100).toFixed(2)}%`;
         document.querySelector('#forecast').textContent = data.predicted_close.toFixed(2);
         document.querySelector('#probability').textContent = data.predicted_probability === undefined ? 'Unavailable' : `${(data.predicted_probability * 100).toFixed(2)}%`;

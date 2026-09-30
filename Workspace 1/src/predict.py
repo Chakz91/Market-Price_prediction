@@ -7,7 +7,12 @@ from pathlib import Path
 
 import joblib
 
-from .data import aligned_context_features, download_prices
+from .data import (
+    aligned_context_features,
+    build_macro_sentiment_features,
+    download_prices,
+    download_ticker_news_sentiment,
+)
 from .evaluation import predict_probability
 from .features import build_features
 
@@ -24,10 +29,16 @@ def main() -> None:
     benchmark = download_prices(bundle.get("benchmark", "SPY"), period="1y")
     sector = download_prices(bundle.get("sector", "XLK"), period="1y")
     volatility_index = download_prices(bundle.get("volatility_index", "^VIX"), period="1y")
+    news_df = download_ticker_news_sentiment(ticker)
+    macro_sentiment_df = build_macro_sentiment_features(
+        bundle.get("benchmark", "SPY"), bundle.get("sector", "XLK")
+    )
     features = build_features(
         prices,
         aligned_context_features(benchmark, sector, volatility_index),
         include_target=False,
+        news_df=news_df,
+        macro_sentiment_df=macro_sentiment_df,
     )
     latest = features.iloc[-1]
     model_name = bundle.get("model_name")
@@ -37,16 +48,34 @@ def main() -> None:
     latest_values = latest[bundle.get(feature_key, bundle["features"])].to_frame().T
     predicted_probability = float(predict_probability(bundle["model"], latest_values)[0])
     calibration = bundle.get("return_calibration", {})
-    daily_calibration = calibration.get("1d", {"up_return": 0.0, "down_return": 0.0})
+    model_horizon_sessions = int(bundle.get("model_horizon_sessions", 1))
+    primary_calibration = calibration.get(
+        "5d" if model_horizon_sessions == 5 else "1d",
+        {"up_return": 0.0, "down_return": 0.0},
+    )
     predicted_return = (
-        predicted_probability * daily_calibration["up_return"]
-        + (1 - predicted_probability) * daily_calibration["down_return"]
+        predicted_probability * primary_calibration["up_return"]
+        + (1 - predicted_probability) * primary_calibration["down_return"]
     )
     weekly_model = bundle.get("weekly_model")
     predicted_weekly_return = None
     if weekly_model is not None:
+        weekly_model_name = bundle.get("weekly_model_name", model_name)
+        weekly_feature_key = (
+            "weekly_sequence_features"
+            if weekly_model_name == "lstm"
+            else "weekly_features"
+        )
+        weekly_fallback_key = (
+            "sequence_features" if weekly_model_name == "lstm" else "features"
+        )
+        weekly_columns = bundle.get(
+            weekly_feature_key,
+            bundle.get(weekly_fallback_key, bundle["features"]),
+        )
+        weekly_values = latest[weekly_columns].to_frame().T
         predicted_weekly_probability = float(
-            predict_probability(weekly_model, latest_values)[0]
+            predict_probability(weekly_model, weekly_values)[0]
         )
         weekly_calibration = calibration.get("5d", {"up_return": 0.0, "down_return": 0.0})
         predicted_weekly_return = (
@@ -54,13 +83,14 @@ def main() -> None:
             + (1 - predicted_weekly_probability) * weekly_calibration["down_return"]
         )
     last_close = float(prices["Close"].iloc[-1])
+    horizon_label = "one-week" if model_horizon_sessions == 5 else "next-session"
 
     print(f"Ticker: {ticker}")
     print(f"Last close: {last_close:.2f}")
-    print(f"Predicted next-session return: {predicted_return:+.2%}")
-    print(f"Probability of next-session increase: {predicted_probability:.2%}")
-    print(f"Illustrative predicted close: {last_close * (1 + predicted_return):.2f}")
-    if predicted_weekly_return is not None:
+    print(f"Predicted {horizon_label} return: {predicted_return:+.2%}")
+    print(f"Probability of {horizon_label} increase: {predicted_probability:.2%}")
+    print(f"Illustrative {horizon_label} close: {last_close * (1 + predicted_return):.2f}")
+    if predicted_weekly_return is not None and model_horizon_sessions != 5:
         print(f"Predicted 1-week return: {predicted_weekly_return:+.2%}")
         print(f"Illustrative 1-week predicted close: {last_close * (1 + predicted_weekly_return):.2f}")
     print("This is a statistical estimate, not financial advice.")
